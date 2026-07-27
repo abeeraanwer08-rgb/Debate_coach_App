@@ -7,10 +7,27 @@ const express = require('express');
 const path = require('path');
 const crypto = require('crypto');
 
-const formats = require('./data/formats.json');
-const motions = require('./data/motions.json');
-const fallacies = require('./data/fallacies.json');
-const guide = require('./data/guide.json');
+const fs = require('fs');
+const path = require('path');
+
+function loadDataFile(filename) {
+  const paths = [
+    path.join(__dirname, 'data', filename),
+    path.join(__dirname, 'podium-debate-coach', 'data', filename),
+    path.join(__dirname, 'debate-coach', 'data', filename),
+  ];
+  for (const p of paths) {
+    if (fs.existsSync(p)) {
+      return require(p);
+    }
+  }
+  throw new Error(`Cannot find ${filename} in any expected location.`);
+}
+
+const formats = loadDataFile('formats.json');
+const motions = loadDataFile('motions.json');
+const fallacies = loadDataFile('fallacies.json');
+const guide = loadDataFile('guide.json');
 const { callGroq, callGroqJSON, callGroqVision } = require('./utils/groq');
 const {
   buildSpeechPrompt,
