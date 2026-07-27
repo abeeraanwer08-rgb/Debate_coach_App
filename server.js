@@ -6,28 +6,8 @@ require('dotenv').config();
 const express = require('express');
 const path = require('path');
 const crypto = require('crypto');
-
 const fs = require('fs');
-const path = require('path');
 
-function loadDataFile(filename) {
-  const paths = [
-    path.join(__dirname, 'data', filename),
-    path.join(__dirname, 'podium-debate-coach', 'data', filename),
-    path.join(__dirname, 'debate-coach', 'data', filename),
-  ];
-  for (const p of paths) {
-    if (fs.existsSync(p)) {
-      return require(p);
-    }
-  }
-  throw new Error(`Cannot find ${filename} in any expected location.`);
-}
-
-const formats = loadDataFile('formats.json');
-const motions = loadDataFile('motions.json');
-const fallacies = loadDataFile('fallacies.json');
-const guide = loadDataFile('guide.json');
 const { callGroq, callGroqJSON, callGroqVision } = require('./utils/groq');
 const {
   buildSpeechPrompt,
@@ -44,11 +24,30 @@ const {
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(express.json({ limit: '8mb' })); // generous limit to allow a few base64 video frames
+app.use(express.json({ limit: '8mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 app.use('/data', express.static(path.join(__dirname, 'data')));
 
-// In-memory store for shareable results (resets on server restart / new deploy).
+// ---------- Load data files (SIMPLE & RELIABLE) ----------
+const dataPath = path.join(__dirname, 'data');
+
+let formats, motions, fallacies, guide;
+try {
+  formats = require(path.join(dataPath, 'formats.json'));
+  motions = require(path.join(dataPath, 'motions.json'));
+  fallacies = require(path.join(dataPath, 'fallacies.json'));
+  guide = require(path.join(dataPath, 'guide.json'));
+  console.log('✅ Data files loaded successfully from:', dataPath);
+} catch (err) {
+  console.error('❌ Failed to load data files:', err.message);
+  // Provide fallback empty data so the app doesn't crash
+  formats = {};
+  motions = [];
+  fallacies = [];
+  guide = {};
+}
+
+// In-memory store for shareable results
 const shareStore = new Map();
 
 // ---------- Reference data ----------
@@ -57,7 +56,7 @@ app.get('/api/formats', (req, res) => res.json(formats));
 
 app.get('/api/motions/random', (req, res) => {
   const { style } = req.query;
-  const pick = motions[Math.floor(Math.random() * motions.length)];
+  const pick = motions.length ? motions[Math.floor(Math.random() * motions.length)] : 'Should artificial intelligence be regulated?';
   res.json({ motion: pick, style: style || null });
 });
 
@@ -165,22 +164,25 @@ app.post('/api/suggest', async (req, res) => {
 // ---------- Format Guide AI chatbot ----------
 
 function guideContextText() {
+  if (!guide || typeof guide !== 'object') return 'No guide data available.';
   return Object.values(guide).map((fmt) => {
-    const lines = [`### ${fmt.name}`, fmt.summary];
+    const lines = [`### ${fmt.name || 'Unknown Format'}`, fmt.summary || ''];
     (fmt.benches || []).forEach((bench) => {
       lines.push(`Team: ${bench.team}`);
-      bench.speakers.forEach((sp) => lines.push(`  ${sp.role} — ${sp.duties.join(' ')}`));
+      bench.speakers.forEach((sp) => lines.push(`  ${sp.role} — ${(sp.duties || []).join(' ')}`));
     });
     (fmt.sides || []).forEach((side) => {
-      lines.push(`${side.role} — ${side.duties.join(' ')} Responsibilities: ${side.responsibilities.join(' ')}`);
+      lines.push(`${side.role} — ${(side.duties || []).join(' ')} Responsibilities: ${(side.responsibilities || []).join(' ')}`);
     });
     if (fmt.speakingOrderTable) {
       lines.push('Speaking order: ' + fmt.speakingOrderTable.map(([a, b, c]) => `${a} (${b}, ${c})`).join(', '));
     } else if (fmt.speakingOrder) {
       lines.push('Speaking order: ' + fmt.speakingOrder.map(([a, b]) => `${a} (${b})`).join(', '));
     }
-    lines.push(`${fmt.qanda.title} — ${fmt.qanda.explanation} Rules: ${fmt.qanda.rules.join(' ')}`);
-    lines.push('Key concepts: ' + fmt.keyConcepts.join(' '));
+    if (fmt.qanda) {
+      lines.push(`${fmt.qanda.title || 'Q&A'} — ${fmt.qanda.explanation || ''} Rules: ${(fmt.qanda.rules || []).join(' ')}`);
+    }
+    lines.push('Key concepts: ' + (fmt.keyConcepts || []).join(' '));
     return lines.join('\n');
   }).join('\n\n');
 }
@@ -198,13 +200,13 @@ app.post('/api/guide/ask', async (req, res) => {
   }
 });
 
-// ---------- Live fallacy analysis (AI pass on top of local pattern matching) ----------
+// ---------- Live fallacy analysis ----------
 
 app.post('/api/analyze-fallacies', async (req, res) => {
   try {
     const { text } = req.body;
     if (!text || text.trim().length < 12) return res.json({ fallacies: [] });
-    const validIds = new Set(fallacies.map((f) => f.id));
+    const validIds = new Set((fallacies || []).map((f) => f.id));
     const messages = [
       {
         role: 'system',
@@ -234,7 +236,6 @@ app.post('/api/analyze-frames', async (req, res) => {
     res.json({ notes: notes.trim() });
   } catch (err) {
     console.error('[analyze-frames]', err.message);
-    // Graceful fallback so a missing/rotated vision model never breaks the round.
     res.json({ notes: 'Video was recorded, but automated body-language analysis was unavailable this round. Review the replay yourself for posture, eye contact, and gesture cues.', fallback: true });
   }
 });
@@ -250,7 +251,6 @@ app.post('/api/judge', async (req, res) => {
     const messages = buildJudgePrompt({ style, motion, speakers, transcript });
     const result = await callGroqJSON(messages, { temperature: 0.4, maxTokens: 1600 });
 
-    // Guardrails: clamp scores 0-100, ensure every speaker has an entry.
     const byId = new Map((result.speakerScores || []).map((s) => [s.id, s]));
     result.speakerScores = speakers.map((sp) => {
       const s = byId.get(sp.id) || { content: 24, strategy: 18, style: 12, rebuttal: 6 };
@@ -270,11 +270,6 @@ app.post('/api/judge', async (req, res) => {
       result.bestSpeakerId = result.speakerScores[0]?.id;
     }
 
-    // Team ranking is computed here, deterministically, from the clamped speaker
-    // totals — never trusted from the model's own arithmetic. This matters most
-    // for British Parliamentary, which has 4 independent benches (Opening Gov,
-    // Opening Opp, Closing Gov, Closing Opp) that must be ranked 1st-4th; it is
-    // NOT a two-side Gov-vs-Opp format like Asian Parliamentary or Lincoln-Douglas.
     const scoreById = new Map(result.speakerScores.map((s) => [s.id, s.total]));
     const teamTotals = new Map();
     const teamMeta = new Map();
@@ -331,7 +326,7 @@ app.get('/api/share/:id', (req, res) => {
   res.json(item);
 });
 
-// Fallback to index.html for any non-API route (single-page app).
+// Fallback to index.html for any non-API route
 app.get(/^(?!\/api\/).*/, (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
